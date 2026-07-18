@@ -96,14 +96,26 @@ def main():
     cfg = project.analyses.CFGFast(normalize=True, force_complete_scan=False)
 
     # ========================================================
-    # 【新增：全局无脑拦截并直接返回所有的 datadiv_decode 函数】
+    # 【终极三重保险：全局无脑拦截并直接返回所有的 datadiv_decode 函数】
     # ========================================================
     print('*******************global hook datadiv_decode****************')
+    
+    # 保险 1：硬编码 RVA 地址 (基于 libfekit-9.3.20.so 的精确计算：0x971cec - 0x24108 - 0x400000 = 0x54dbc4)
+    target_decode_addr = project.loader.main_object.mapped_base + 0x54dbc4
+    print(f"Hooking hardcoded datadiv_decode RVA at {hex(target_decode_addr)}")
+    project.hook(target_decode_addr, GlobalRetnProcedure())
+
+    # 保险 2：动态扫描符号表（防止未剥离符号的情况）
     for symbol in project.loader.main_object.symbols:
         if 'datadiv_decode' in symbol.name:
-            print(f"Global Hooked: {symbol.name} at {hex(symbol.rebased_addr)}")
-            # 这里注册我们刚才写好的 GlobalRetnProcedure 实例
+            print(f"Global Hooked (via Symbol): {symbol.name} at {hex(symbol.rebased_addr)}")
             project.hook(symbol.rebased_addr, GlobalRetnProcedure())
+
+    # 保险 3：动态扫描 CFG 识别出的函数表（防止符号表被剥离，但 angr 内部恢复了函数名的情况）
+    for func_addr, func in cfg.kb.functions.items():
+        if 'datadiv_decode' in func.name:
+            print(f"Global Hooked (via CFG): {func.name} at {hex(func_addr)}")
+            project.hook(func_addr, GlobalRetnProcedure())
     # ========================================================
 
     base_addr = project.loader.main_object.mapped_base >> 12 << 12
