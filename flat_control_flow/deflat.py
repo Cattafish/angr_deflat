@@ -96,26 +96,36 @@ def main():
     cfg = project.analyses.CFGFast(normalize=True, force_complete_scan=False)
 
     # ========================================================
-    # 【终极三重保险：全局无脑拦截并直接返回所有的 datadiv_decode 函数】
+    # 【物理级三重保险：全局无脑拦截并直接返回所有的 datadiv_decode 函数】
     # ========================================================
     print('*******************global hook datadiv_decode****************')
     
-    # 保险 1：硬编码 RVA 地址 (基于 libfekit-9.3.20.so 的精确计算：0x971cec - 0x24108 - 0x400000 = 0x54dbc4)
-    target_decode_addr = project.loader.main_object.mapped_base + 0x54dbc4
-    print(f"Hooking hardcoded datadiv_decode RVA at {hex(target_decode_addr)}")
-    project.hook(target_decode_addr, GlobalRetnProcedure())
+    # 打印调试信息，确认加载基址
+    mapped_base = project.loader.main_object.mapped_base
+    print(f"[DEBUG] Main object mapped_base: {hex(mapped_base)}")
 
-    # 保险 2：动态扫描符号表（防止未剥离符号的情况）
+    # 极简且稳健的 Python 物理返回 Hook（直接操作 ARM64 寄存器）
+    def global_retn_procedure(state):
+        # 核心：手动读取 ARM64 硬件寄存器 x30，强行写入 pc 寄存器
+        state.regs.pc = state.regs.x30
+        return
+
+    # 保险 1：硬编码 RVA 地址 (基于 libfekit-9.3.20.so 精确计算)
+    target_decode_addr = mapped_base + 0x54dbc4
+    print(f"Hooking hardcoded datadiv_decode RVA at {hex(target_decode_addr)}")
+    project.hook(target_decode_addr, global_retn_procedure)
+
+    # 保险 2：动态扫描符号表（作为备用保险）
     for symbol in project.loader.main_object.symbols:
         if 'datadiv_decode' in symbol.name:
             print(f"Global Hooked (via Symbol): {symbol.name} at {hex(symbol.rebased_addr)}")
-            project.hook(symbol.rebased_addr, GlobalRetnProcedure())
+            project.hook(symbol.rebased_addr, global_retn_procedure)
 
-    # 保险 3：动态扫描 CFG 识别出的函数表（防止符号表被剥离，但 angr 内部恢复了函数名的情况）
+    # 保险 3：动态扫描 CFG 识别出的函数表（作为备用保险）
     for func_addr, func in cfg.kb.functions.items():
         if 'datadiv_decode' in func.name:
             print(f"Global Hooked (via CFG): {func.name} at {hex(func_addr)}")
-            project.hook(func_addr, GlobalRetnProcedure())
+            project.hook(func_addr, global_retn_procedure)
     # ========================================================
 
     base_addr = project.loader.main_object.mapped_base >> 12 << 12
