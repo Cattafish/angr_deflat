@@ -87,6 +87,20 @@ def main():
     project = angr.Project(filename, load_options={'auto_load_libs': False})
     # do normalize to avoid overlapping blocks, disable force_complete_scan to avoid possible "wrong" blocks
     cfg = project.analyses.CFGFast(normalize=True, force_complete_scan=False)
+    # ========================================================
+    # 【新增：全局 Hook 所有的 datadiv_decode 加密函数入口点】
+    # ========================================================
+    def global_retn_procedure(state):
+        # 极简模拟返回程序，直接跳过复杂的解密循环，防止内存爆炸
+        return
+
+    print('*******************global hook datadiv_decode****************')
+    for symbol in project.loader.main_object.symbols:
+        if 'datadiv_decode' in symbol.name:
+            print(f"Global Hooked: {symbol.name} at {hex(symbol.rebased_addr)}")
+            project.hook(symbol.rebased_addr, global_retn_procedure)
+    # ========================================================
+
     base_addr = project.loader.main_object.mapped_base >> 12 << 12
     target_function = cfg.functions.get(start)
     if target_function is None:
