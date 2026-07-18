@@ -1,7 +1,7 @@
 name: OLLVM Deflat
 
 on:
-  workflow_dispatch: # 允许在 GitHub 网页端手动触发运行
+  workflow_dispatch: # 允许在 GitHub 网页上手动触发运行
 
 jobs:
   deflat:
@@ -21,14 +21,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install angr
 
-      - name: Run deflat.py
+      - name: Clone Deflat Tool and Run Deobfuscation
         run: |
-          # 提示：请根据你仓库中实际的脚本参数格式进行微调（详见下方说明）
+          # 1. 克隆官方 deflat 脚本仓库到本地临时目录 deflat_tools
+          git clone https://github.com/cq674350529/deflat.git deflat_tools
+          
+          # 2. 将存放在你仓库根目录下的 .so 文件，复制到工具仓库的平坦化去除目录下
+          cp libfekit-9.3.20.so deflat_tools/flat_control_flow/
+          
+          # 3. 进入该目录运行去混淆脚本
+          cd deflat_tools/flat_control_flow
           python3 deflat.py -f libfekit-9.3.20.so --addr 0x967CE8
+          
+          # 4. 把生成好的 libfekit-9.3.20_recovered.so 文件复制回根目录，以便后续保存
+          cp libfekit-9.3.20_recovered.so ../../
 
       - name: Upload Recovered Binary
         uses: actions/upload-artifact@v4
         with:
           name: deflat-recovered-so
-          path: |
-            *recovered*
+          path: libfekit-9.3.20_recovered.so
