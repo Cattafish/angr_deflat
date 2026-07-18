@@ -36,9 +36,8 @@ def get_relevant_nop_nodes(supergraph, pre_dispatcher_node, prologue_node, retn_
 def symbolic_execution(project, relevant_block_addrs, start_addr, hook_addrs=None, modify_value=None, inspect=False):
 
     def retn_procedure(state):
-        ip = state.solver.eval(state.regs.ip)
-        project.unhook(ip)
-        return
+        # 移除了 project.unhook(ip)，确保 Hook 能够持久生效，绝不进入子函数
+        pass
 
     def statement_inspect(state):
         expressions = list(
