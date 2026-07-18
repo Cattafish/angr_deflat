@@ -16,6 +16,33 @@ from util import *
 import logging
 logging.getLogger('angr.state_plugins.symbolic_memory').setLevel(logging.ERROR)
 # logging.getLogger('angr.sim_manager').setLevel(logging.DEBUG)
+
+
+# ========================================================
+# 【核心优化】：定义极简保底 SimProcedures
+# 彻底拦截 memcpy、malloc 等函数，阻止其生成任何无用的符号内存，锁死内存暴涨！
+# ========================================================
+class DummyMemcpy(angr.SimProcedure):
+    def run(self, dst, src, size):
+        # 绝不拷贝任何符号字节，直接返回目标地址
+        return dst
+
+class DummyMalloc(angr.SimProcedure):
+    def run(self, size):
+        # 直接返回一个具体的假堆地址，不进行复杂的 Z3 求解
+        return 0x50000000
+
+class DummyMemset(angr.SimProcedure):
+    def run(self, s, c, n):
+        return s
+
+class DummyFree(angr.SimProcedure):
+    def run(self, ptr):
+        return
+
+class DummyRealloc(angr.SimProcedure):
+    def run(self, ptr, size):
+        return 0x60000000
     
 
 def get_relevant_nop_nodes(supergraph, pre_dispatcher_node, prologue_node, retn_node):
@@ -55,9 +82,8 @@ def symbolic_execution(project, relevant_block_addrs, start_addr, hook_addrs=Non
         for hook_addr in hook_addrs:
             project.hook(hook_addr, retn_procedure, length=skip_length)
 
-    # 【无损优化】：
-    # 1. 移除 ZERO_FILL_UNCONSTRAINED 选项，防止未初始化变量落入 concrete 0 引起的无限死循环！
-    # 2. 启用 DOWNSIZE_Z3，让 Z3 约束求解器定时强制释放内存，解决长跑时的 OOM 溢出，同时保持 100% 还原精度。
+    # 1. 移除 ZERO_FILL 选项，防止未初始化变量落入死循环
+    # 2. 仅保留 DOWNSIZE_Z3 自动回收 Z3 求解上下文内存
     state = project.factory.blank_state(
         addr=start_addr, 
         remove_options={angr.sim_options.LAZY_SOLVES},
@@ -92,6 +118,17 @@ def main():
     start = int(args.addr, 16)
 
     project = angr.Project(filename, load_options={'auto_load_libs': False})
+    
+    # ========================================================
+    # 【终极拦截】：全局挂载极简 SimProcedures
+    # 彻底杜绝由于符号变量（Symbolic Size）引起的 Z3 求解暴涨和内存崩溃！
+    # ========================================================
+    project.hook_symbol('memcpy', DummyMemcpy())
+    project.hook_symbol('malloc', DummyMalloc())
+    project.hook_symbol('memset', DummyMemset())
+    project.hook_symbol('free', DummyFree())
+    project.hook_symbol('realloc', DummyRealloc())
+    
     # do normalize to avoid overlapping blocks, disable force_complete_scan to avoid possible "wrong" blocks
     cfg = project.analyses.CFGFast(normalize=True, force_complete_scan=False)
     base_addr = project.loader.main_object.mapped_base >> 12 << 12
