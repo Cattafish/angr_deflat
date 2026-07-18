@@ -37,7 +37,7 @@ def symbolic_execution(project, relevant_block_addrs, start_addr, hook_addrs=Non
 
     def retn_procedure(state):
         # 极其重要：移除原先的 project.unhook(ip)
-        # 避免 Hook 在第一次执行后被永久拔掉，导致循环分支或后续 DSE 步骤失效
+        # 避免 Hook 在第一次执行后被永久拔掉，导致后续循环分支或 DSE 步骤失效
         pass
 
     def statement_inspect(state):
@@ -55,18 +55,13 @@ def symbolic_execution(project, relevant_block_addrs, start_addr, hook_addrs=Non
         for hook_addr in hook_addrs:
             project.hook(hook_addr, retn_procedure, length=skip_length)
 
-    # 【核心安全优化】：
-    # 1. 开启 ZERO_FILL_UNCONSTRAINED_REGISTERS & ZERO_FILL_UNCONSTRAINED_MEMORY
-    #    使得未初始化寄存器和内存默认填充为 0，防止其符号化后产生路径爆炸，保留 100% 还原效果！
-    # 2. 开启 DOWNSIZE_Z3，让 Z3 引擎定时释放内存，防止由于函数超大而发生内存耗尽
+    # 【无损优化】：
+    # 1. 移除 ZERO_FILL_UNCONSTRAINED 选项，防止未初始化变量落入 concrete 0 引起的无限死循环！
+    # 2. 启用 DOWNSIZE_Z3，让 Z3 约束求解器定时强制释放内存，解决长跑时的 OOM 溢出，同时保持 100% 还原精度。
     state = project.factory.blank_state(
         addr=start_addr, 
         remove_options={angr.sim_options.LAZY_SOLVES},
-        add_options={
-            angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
-            angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
-            angr.options.DOWNSIZE_Z3
-        }
+        add_options={angr.options.DOWNSIZE_Z3}
     )
     if inspect:
         state.inspect.b(
@@ -74,11 +69,6 @@ def symbolic_execution(project, relevant_block_addrs, start_addr, hook_addrs=Non
     sm = project.factory.simulation_manager(state)
     sm.step()
     while len(sm.active) > 0:
-        # 状态保护监控：由于开启了零值填充，正常分析绝不会发生爆炸。
-        # 如果因为某些未知的复杂指令导致分叉异常地超过了 15 个，我们再实施温和的剪枝保护，防止崩溃
-        if len(sm.active) > 15:
-            sm.active = sm.active[-1:]
-            
         for active_state in sm.active:
             if active_state.addr in relevant_block_addrs:
                 return active_state.addr
