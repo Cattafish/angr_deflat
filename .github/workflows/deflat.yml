@@ -1,7 +1,7 @@
 name: OLLVM Deflat
 
 on:
-  workflow_dispatch: # 允许在 GitHub 页面手动触发运行
+  workflow_dispatch: # 允许手动触发
 
 jobs:
   deflat:
@@ -16,42 +16,39 @@ jobs:
         with:
           python-version: '3.10'
 
-      # === 新增步骤：手动开启 12GB Swap 虚拟内存，防止 angr 被系统杀死 ===
+      # ==========================================
+      # 1. 开启 12GB Swap 虚拟空间（防止 angr 溢出）
+      # ==========================================
       - name: Create 12GB Swap Space
         run: |
-          echo "=== 开启 Swap 前内存状态 ==="
+          echo "=== Before creating swap ==="
           free -h
-          
-          # 创建并启用 12GB 的虚拟内存交换文件
           sudo swapoff -a
           sudo fallocate -l 12G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
-          
-          echo "=== 开启 Swap 后内存状态 ==="
+          echo "=== After creating swap ==="
           free -h
 
+      # ==========================================
+      # 2. 安装基础依赖
+      # ==========================================
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install angr
 
-      - name: Clone Deflat Tool and Run Deobfuscation
+      # ==========================================
+      # 3. 直接运行你仓库里的去混淆脚本
+      # ==========================================
+      - name: Run Deobfuscation
         run: |
-          # 1. 克隆官方工具
-          git clone https://github.com/cq674350529/deflat.git deflat_tools
-          
-          # 2. 复制你的 .so 文件入内
-          cp libfekit-9.3.20.so deflat_tools/flat_control_flow/
-          
-          # 3. 运行去混淆脚本
-          cd deflat_tools/flat_control_flow
           python3 deflat.py -f libfekit-9.3.20.so --addr 0x967CE8
-          
-          # 4. 把生成好的文件复制回根目录
-          cp libfekit-9.3.20_recovered.so ../../
 
+      # ==========================================
+      # 4. 上传产物
+      # ==========================================
       - name: Upload Recovered Binary
         uses: actions/upload-artifact@v4
         with:
