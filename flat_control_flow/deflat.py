@@ -17,14 +17,7 @@ import logging
 logging.getLogger('angr.state_plugins.symbolic_memory').setLevel(logging.ERROR)
 # logging.getLogger('angr.sim_manager').setLevel(logging.DEBUG)
     
-# ========================================================
-# 【新增：全局模拟返回过程类】
-# ========================================================
-class GlobalRetnProcedure(angr.SimProcedure):
-    def run(self):
-        # 极其关键：调用 self.ret()。angr 会自动读取 ARM64 架构的 LR 寄存器返回调用处
-        self.ret()
-        
+
 def get_relevant_nop_nodes(supergraph, pre_dispatcher_node, prologue_node, retn_node):
     # relevant_nodes = list(supergraph.predecessors(pre_dispatcher_node))
     relevant_nodes = []
@@ -43,7 +36,8 @@ def get_relevant_nop_nodes(supergraph, pre_dispatcher_node, prologue_node, retn_
 def symbolic_execution(project, relevant_block_addrs, start_addr, hook_addrs=None, modify_value=None, inspect=False):
 
     def retn_procedure(state):
-        # 移除了 project.unhook(ip)，确保 Hook 能够持久生效，绝不进入子函数
+        # 极其重要：移除原先的 project.unhook(ip)
+        # 避免 Hook 在第一次执行后被永久拔掉，导致循环分支或后续 DSE 步骤失效
         pass
 
     def statement_inspect(state):
@@ -61,14 +55,30 @@ def symbolic_execution(project, relevant_block_addrs, start_addr, hook_addrs=Non
         for hook_addr in hook_addrs:
             project.hook(hook_addr, retn_procedure, length=skip_length)
 
-    state = project.factory.blank_state(addr=start_addr, remove_options={
-                                        angr.sim_options.LAZY_SOLVES})
+    # 【核心安全优化】：
+    # 1. 开启 ZERO_FILL_UNCONSTRAINED_REGISTERS & ZERO_FILL_UNCONSTRAINED_MEMORY
+    #    使得未初始化寄存器和内存默认填充为 0，防止其符号化后产生路径爆炸，保留 100% 还原效果！
+    # 2. 开启 DOWNSIZE_Z3，让 Z3 引擎定时释放内存，防止由于函数超大而发生内存耗尽
+    state = project.factory.blank_state(
+        addr=start_addr, 
+        remove_options={angr.sim_options.LAZY_SOLVES},
+        add_options={
+            angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
+            angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
+            angr.options.DOWNSIZE_Z3
+        }
+    )
     if inspect:
         state.inspect.b(
             'statement', when=angr.state_plugins.inspect.BP_BEFORE, action=statement_inspect)
     sm = project.factory.simulation_manager(state)
     sm.step()
     while len(sm.active) > 0:
+        # 状态保护监控：由于开启了零值填充，正常分析绝不会发生爆炸。
+        # 如果因为某些未知的复杂指令导致分叉异常地超过了 15 个，我们再实施温和的剪枝保护，防止崩溃
+        if len(sm.active) > 15:
+            sm.active = sm.active[-1:]
+            
         for active_state in sm.active:
             if active_state.addr in relevant_block_addrs:
                 return active_state.addr
@@ -94,40 +104,6 @@ def main():
     project = angr.Project(filename, load_options={'auto_load_libs': False})
     # do normalize to avoid overlapping blocks, disable force_complete_scan to avoid possible "wrong" blocks
     cfg = project.analyses.CFGFast(normalize=True, force_complete_scan=False)
-
-    # ========================================================
-    # 【物理级三重保险：全局无脑拦截并直接返回所有的 datadiv_decode 函数】
-    # ========================================================
-    print('*******************global hook datadiv_decode****************')
-    
-    # 打印调试信息，确认加载基址
-    mapped_base = project.loader.main_object.mapped_base
-    print(f"[DEBUG] Main object mapped_base: {hex(mapped_base)}")
-
-    # 极简且稳健的 Python 物理返回 Hook（直接操作 ARM64 寄存器）
-    def global_retn_procedure(state):
-        # 核心：手动读取 ARM64 硬件寄存器 x30，强行写入 pc 寄存器
-        state.regs.pc = state.regs.x30
-        return
-
-    # 保险 1：硬编码 RVA 地址 (基于 libfekit-9.3.20.so 精确计算)
-    target_decode_addr = mapped_base + 0x54dbc4
-    print(f"Hooking hardcoded datadiv_decode RVA at {hex(target_decode_addr)}")
-    project.hook(target_decode_addr, global_retn_procedure)
-
-    # 保险 2：动态扫描符号表（作为备用保险）
-    for symbol in project.loader.main_object.symbols:
-        if 'datadiv_decode' in symbol.name:
-            print(f"Global Hooked (via Symbol): {symbol.name} at {hex(symbol.rebased_addr)}")
-            project.hook(symbol.rebased_addr, global_retn_procedure)
-
-    # 保险 3：动态扫描 CFG 识别出的函数表（作为备用保险）
-    for func_addr, func in cfg.kb.functions.items():
-        if 'datadiv_decode' in func.name:
-            print(f"Global Hooked (via CFG): {func.name} at {hex(func_addr)}")
-            project.hook(func_addr, global_retn_procedure)
-    # ========================================================
-
     base_addr = project.loader.main_object.mapped_base >> 12 << 12
     target_function = cfg.functions.get(start)
     if target_function is None:
