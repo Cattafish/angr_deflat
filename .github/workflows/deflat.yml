@@ -40,11 +40,21 @@ jobs:
           pip install angr
 
       # ==========================================
-      # 3. 直接运行你仓库里的去混淆脚本
+      # 3. 进入子目录并运行你仓库里的去混淆脚本
       # ==========================================
       - name: Run Deobfuscation
         run: |
+          # 1. 将放在根目录下的 .so 复制到去混淆脚本所在的子目录下
+          cp libfekit-9.3.20.so flat_control_flow/
+          
+          # 2. 进入该目录（这样才能顺利 import am_graph 和 util）
+          cd flat_control_flow
+          
+          # 3. 运行去混淆脚本
           python3 deflat.py -f libfekit-9.3.20.so --addr 0x967CE8
+          
+          # 4. 把生成好的还原文件复制回工作区根目录，以便后面的上传步骤能够找到它
+          cp libfekit-9.3.20_recovered.so ../
 
       # ==========================================
       # 4. 上传产物
