@@ -17,7 +17,14 @@ import logging
 logging.getLogger('angr.state_plugins.symbolic_memory').setLevel(logging.ERROR)
 # logging.getLogger('angr.sim_manager').setLevel(logging.DEBUG)
     
-
+# ========================================================
+# 【新增：全局模拟返回过程类】
+# ========================================================
+class GlobalRetnProcedure(angr.SimProcedure):
+    def run(self):
+        # 极其关键：调用 self.ret()。angr 会自动读取 ARM64 架构的 LR 寄存器返回调用处
+        self.ret()
+        
 def get_relevant_nop_nodes(supergraph, pre_dispatcher_node, prologue_node, retn_node):
     # relevant_nodes = list(supergraph.predecessors(pre_dispatcher_node))
     relevant_nodes = []
@@ -87,18 +94,16 @@ def main():
     project = angr.Project(filename, load_options={'auto_load_libs': False})
     # do normalize to avoid overlapping blocks, disable force_complete_scan to avoid possible "wrong" blocks
     cfg = project.analyses.CFGFast(normalize=True, force_complete_scan=False)
-    # ========================================================
-    # 【新增：全局 Hook 所有的 datadiv_decode 加密函数入口点】
-    # ========================================================
-    def global_retn_procedure(state):
-        # 极简模拟返回程序，直接跳过复杂的解密循环，防止内存爆炸
-        return
 
+    # ========================================================
+    # 【新增：全局无脑拦截并直接返回所有的 datadiv_decode 函数】
+    # ========================================================
     print('*******************global hook datadiv_decode****************')
     for symbol in project.loader.main_object.symbols:
         if 'datadiv_decode' in symbol.name:
             print(f"Global Hooked: {symbol.name} at {hex(symbol.rebased_addr)}")
-            project.hook(symbol.rebased_addr, global_retn_procedure)
+            # 这里注册我们刚才写好的 GlobalRetnProcedure 实例
+            project.hook(symbol.rebased_addr, GlobalRetnProcedure())
     # ========================================================
 
     base_addr = project.loader.main_object.mapped_base >> 12 << 12
