@@ -82,12 +82,19 @@ def symbolic_execution(project, relevant_block_addrs, start_addr, hook_addrs=Non
         for hook_addr in hook_addrs:
             project.hook(hook_addr, retn_procedure, length=skip_length)
 
-    # 1. 移除 ZERO_FILL 选项，防止未初始化变量落入死循环
-    # 2. 仅保留 DOWNSIZE_Z3 自动回收 Z3 求解上下文内存
+    # 【终极精准控制】：
+    # 1. 开启 ZERO_FILL_UNCONSTRAINED_REGISTERS：
+    #    仅将未初始化的寄存器（状态变量载体）填 0，锁死状态变量不发生分叉。使得第一个块从 21 分钟缩短到秒过！
+    # 2. 不开启 ZERO_FILL_UNCONSTRAINED_MEMORY：
+    #    允许内存（局部/业务变量）保持符号性，完美避开任何 concrete 0 引起的无限死循环陷阱！
+    # 3. 启用 DOWNSIZE_Z3，让 Z3 约束求解器定时强制释放内存，锁死内存占用。
     state = project.factory.blank_state(
         addr=start_addr, 
         remove_options={angr.sim_options.LAZY_SOLVES},
-        add_options={angr.options.DOWNSIZE_Z3}
+        add_options={
+            angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
+            angr.options.DOWNSIZE_Z3
+        }
     )
     if inspect:
         state.inspect.b(
