@@ -260,10 +260,23 @@ def main():
     for dp_node in dispatcher_nodes:
         fill_nop(origin_data, project.loader.main_object.addr_to_offset(dp_node.addr), dp_node.size, project.arch)
 
-    for parent, childs in flow.items():
+   for parent, childs in flow.items():
         if len(childs) == 1:
-            parent_block = project.factory.block(parent.addr, size=parent.size)
-            last_instr = parent_block.capstone.insns[-1]
+            # === 修复 BL/BLR 块被中途截断的致命 Bug ===
+            # 如果业务块中途因为 BL 调用被 angr 提前截断，我们必须沿着内存地址往后追溯，
+            # 直到找到该连续内存块中，真正用于跳转回分发树的 B 或 B.cond 指令。
+            curr_addr = parent.addr
+            while True:
+                block = project.factory.block(curr_addr)
+                last_ins = block.capstone.insns[-1]
+                mnem = last_ins.mnemonic.lower()
+                # 只有遇到真正的跳转指令 B 或 B.cond，才是这个连续业务块真正的出口
+                if mnem == 'b' or mnem.startswith('b.'):
+                    last_instr = last_ins
+                    break
+                # 如果是 BL/BLR 等调用，说明后面还有业务指令，我们继续往后看下一个块
+                curr_addr = last_ins.address + 4
+
             file_offset = project.loader.main_object.addr_to_offset(last_instr.address)
             if project.arch.name in ARCH_ARM64:
                 if parent.addr in [start, base_addr + start]:
