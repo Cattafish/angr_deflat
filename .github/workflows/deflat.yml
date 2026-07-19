@@ -6,54 +6,31 @@ on:
 jobs:
   deflat:
     runs-on: ubuntu-latest
+    
+    # 【改动点】使用 angr 官方自带完善 Unicorn 环境的镜像！
+    # 添加 options: --user root 防止 Actions Checkout 检出文件时发生权限报错
+    container:
+      image: angr/angr:latest
+      options: --user root
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
       # ==========================================
-      # 1. 开启 12GB Swap 虚拟空间（防止 angr 溢出）
-      # ==========================================
-      - name: Create 12GB Swap Space
-        run: |
-          echo "=== Before creating swap ==="
-          free -h
-          sudo swapoff -a
-          sudo fallocate -l 12G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          echo "=== After creating swap ==="
-          free -h
-
-      # ==========================================
-      # 2. 安装基础依赖
-      # ==========================================
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install angr
-
-      # ==========================================
-      # 3. 进入子目录并运行你仓库里的去混淆脚本
+      # 此时我们已经身处配置好一切环境的 angr 官方容器内
+      # 无需再使用 setup-python 和 pip install 浪费时间，直接运行！
       # ==========================================
       - name: Run Deobfuscation
         run: |
-          # 1. 将放在根目录下的 .so 复制到去混淆脚本所在的子目录下
+          # 1. 复制 SO 文件过去
           cp libfekit-9.3.20.so flat_control_flow/
-          
-          # 2. 进入该目录（这样才能顺利 import am_graph 和 util）
           cd flat_control_flow
           
-          # 3. 运行去混淆脚本
+          # 2. 运行脚本！此时速度会飞快，因为 Unicorn 已经生效！
           python3 deflat.py -f libfekit-9.3.20.so --addr 0x967CE8
           
-          # 4. 把生成好的还原文件复制回工作区根目录，以便后面的上传步骤能够找到它
+          # 3. 提取产物
           cp libfekit-9.3.20_recovered.so ../
 
       # ==========================================
