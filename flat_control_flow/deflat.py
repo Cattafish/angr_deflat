@@ -56,13 +56,14 @@ def get_base_state(project, prologue_addr, main_dispatcher_addr):
     return None
 
 # ========================================================
-# 【安全遍历机制】：大方放行只读指令，杜绝分发树截断
+# 【自适应边界】：移除 size 约束，利用 angr 自动截断，放行只读指令
 # ========================================================
-def is_dispatcher_block(project, addr, size):
-    block = project.factory.block(addr, size=size)
+def is_dispatcher_block(project, addr):
+    # 允许 angr 引擎自动识别基本块边界，完美规避末尾对齐填充字节的干扰
+    block = project.factory.block(addr) 
     allowed_mnemonics = {
         'mov', 'movz', 'movk', 'cmp', 'b', 'nop',
-        'ldr', 'ldur', 'ldp', 'ldpsw',  # 放行只读内存/栈指令，防止分发器在恢复现场时被卡住
+        'ldr', 'ldur', 'ldp', 'ldpsw',
         'b.eq', 'b.ne', 'b.cs', 'b.hs', 'b.cc', 'b.lo', 
         'b.mi', 'b.pl', 'b.vs', 'b.vc', 'b.hi', 'b.ls', 
         'b.ge', 'b.lt', 'b.gt', 'b.le'
@@ -173,7 +174,7 @@ def main():
             continue
         
         # 主分发器可能含有局部现场保存指令，特殊放行，其余块必须通过严格的白名单校验
-        if curr.addr == main_dispatcher_node.addr or is_dispatcher_block(project, curr.addr, curr.size):
+        if curr.addr == main_dispatcher_node.addr or is_dispatcher_block(project, curr.addr):
             dispatcher_nodes.add(curr)
             for succ in supergraph.successors(curr):
                 queue.append(succ)
