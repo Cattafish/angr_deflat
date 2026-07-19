@@ -16,7 +16,7 @@ import logging
 logging.getLogger('angr.state_plugins.symbolic_memory').setLevel(logging.ERROR)
 
 # ========================================================
-# 定义极简保底 SimProcedures，全面拦截 C/C++ 内存分配
+# 拦截 C/C++ 内存分配，避免 DSE 陷入深渊
 # ========================================================
 class DummyMemcpy(angr.SimProcedure):
     def run(self, dst, src, size): return dst
@@ -33,8 +33,29 @@ class DummyFree(angr.SimProcedure):
 class DummyRealloc(angr.SimProcedure):
     def run(self, ptr, size): return 0x60000000
 
+# ========================================================
+# 【关键改进】：获取带有完美寄存器上下文的快照状态
+# ========================================================
+def get_base_state(project, prologue_addr, main_dispatcher_addr):
+    state = project.factory.blank_state(
+        addr=prologue_addr,
+        add_options={
+            angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
+            angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
+            angr.options.DOWNSIZE_Z3
+        }
+    )
+    if project.arch.name == 'AARCH64':
+        state.regs.xsp = 0x7fffffff0000
+        state.regs.x29 = 0x7fffffff0000
+    
+    sm = project.factory.simulation_manager(state)
+    sm.explore(find=main_dispatcher_addr)
+    if sm.found:
+        return sm.found[0]
+    return None
 
-def symbolic_execution(project, relevant_block_addrs, start_addr, hook_addrs=None, modify_value=None, inspect=False):
+def symbolic_execution(project, base_state, relevant_block_addrs, start_addr, hook_addrs=None, modify_value=None, inspect=False):
     def retn_procedure(state):
         pass
 
@@ -42,29 +63,21 @@ def symbolic_execution(project, relevant_block_addrs, start_addr, hook_addrs=Non
         expressions = list(state.scratch.irsb.statements[state.inspect.statement].expressions)
         if len(expressions) != 0 and isinstance(expressions[0], pyvex.expr.ITE):
             state.scratch.temps[expressions[0].cond.tmp] = modify_value
-            state.inspect._breakpoints['statement'] = []
+            # 【修复双状态变量BUG】：绝对不要清除断点！强迫该块里所有的 CSEL 同步走向一致的分支！
+            # state.inspect._breakpoints['statement'] = []
 
     if hook_addrs is not None:
-        skip_length = 4
-        if project.arch.name in ARCH_X86:
-            skip_length = 5
+        skip_length = 4 if project.arch.name not in ARCH_X86 else 5
         for hook_addr in hook_addrs:
+            # 挂载空函数来跳过那些耗时的外部或内部 BL 调用
             project.hook(hook_addr, retn_procedure, length=skip_length)
 
-    state = project.factory.blank_state(
-        addr=start_addr, 
-        remove_options={angr.sim_options.LAZY_SOLVES},
-        add_options={
-            angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
-            angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
-            angr.options.DOWNSIZE_Z3,
-            angr.options.UNICORN 
-        }
-    )
-
-    if project.arch.name == 'AARCH64':
-        state.regs.xsp = 0x7fffffff0000
-        state.regs.x29 = 0x7fffffff0000
+    # 从带有常量的快照状态中启动！
+    state = base_state.copy()
+    state.regs.pc = start_addr
+    
+    # 强制禁用 UNICORN，否则 statement_inspect 会被引擎直接无视，导致分支强制失败
+    state.options.discard(angr.options.UNICORN)
 
     if inspect:
         state.inspect.b('statement', when=angr.state_plugins.inspect.BP_BEFORE, action=statement_inspect)
@@ -72,9 +85,8 @@ def symbolic_execution(project, relevant_block_addrs, start_addr, hook_addrs=Non
     sm = project.factory.simulation_manager(state)
     sm.step()
     
-    # 增加最大步数限制，防止虚假控制流中的死循环陷阱
     step_count = 0
-    max_steps = 200
+    max_steps = 200 # 防止被伪分发器带入死循环
     
     while len(sm.active) > 0:
         for active_state in sm.active:
@@ -87,11 +99,10 @@ def symbolic_execution(project, relevant_block_addrs, start_addr, hook_addrs=Non
         
         step_count += 1
         if step_count > max_steps:
-            print(f"[!] 警告：达到最大步数限制，放弃死循环路径！")
+            print(f"[!] 警告：达到最大步数限制，当前分支进入死胡同。")
             break
 
     return None
-
 
 def main():
     parser = argparse.ArgumentParser(description="deflat control flow script")
@@ -108,7 +119,6 @@ def main():
 
     project = angr.Project(filename, load_options={'auto_load_libs': False})
     
-    # 全面挂载 C/C++ 的库函数
     project.hook_symbol('memcpy', DummyMemcpy())
     project.hook_symbol('malloc', DummyMalloc())
     project.hook_symbol('memset', DummyMemset())
@@ -127,7 +137,6 @@ def main():
 
     supergraph = am_graph.to_supergraph(target_function.transition_graph)
 
-    # 1. 自动寻找序言和返回块
     prologue_node = None
     retn_nodes = []
     for node in supergraph.nodes():
@@ -140,10 +149,11 @@ def main():
         print("[-] 错误：未能找到 Prologue 节点！")
         sys.exit(-1)
 
-    # 2. 识别主分发器
     main_dispatcher_node = list(supergraph.successors(prologue_node))[0]
 
-    # 3. 使用 BFS 算法，精准剥离出所有的分发器树节点 (Dispatcher Tree)
+    # ========================================================
+    # 提取完整且纯粹的分发器树 (Dispatcher Tree)
+    # ========================================================
     dispatcher_nodes = set()
     queue = [main_dispatcher_node]
     while queue:
@@ -151,39 +161,42 @@ def main():
         if curr in dispatcher_nodes:
             continue
         
-        # 分发器块的特征：包含 CMP 和 B.cond，通常很短（小于等于24字节）
-        if curr.addr == main_dispatcher_node.addr or curr.size <= 24:
+        is_real_work = False
+        if curr.addr != main_dispatcher_node.addr:
+            block = project.factory.block(curr.addr, size=curr.size)
+            for ins in block.capstone.insns:
+                mnem = ins.insn.mnemonic
+                # 真实代码的强特征：存在调用、访存、修改状态变量、或返回
+                if mnem in ('bl', 'blr', 'ret') or mnem.startswith(('str', 'stp', 'stur', 'csel', 'cset')):
+                    is_real_work = True
+                    break
+
+        if not is_real_work:
             dispatcher_nodes.add(curr)
             for succ in supergraph.successors(curr):
                 queue.append(succ)
 
-    # 4. 完美识别真实代码块：所有从分发器树生长出来的“叶子节点”就是真实代码块！
+    # 真实的业务块就是从分发器走出来的那个直接节点
     relevant_nodes = []
-    nop_nodes = []
     retn_addrs = [n.addr for n in retn_nodes]
 
     for node in supergraph.nodes():
-        if node.addr == prologue_node.addr or node.addr in retn_addrs:
+        if node.addr == prologue_node.addr or node.addr in retn_addrs or node in dispatcher_nodes:
             continue
-        # 将分发器节点本身加入 NOP 列表，以便最后彻底抹除！
-        if node in dispatcher_nodes:
-            nop_nodes.append(node)
-            continue
-            
-        # 如果一个块的直接前驱节点是分发器，说明它是真实的业务块
-        is_succ = any(pred in dispatcher_nodes for pred in supergraph.predecessors(node))
-        
-        if is_succ:
+        if any(pred in dispatcher_nodes for pred in supergraph.predecessors(node)):
             relevant_nodes.append(node)
-        else:
-            # 剩下的零散预分发器 stub 也全部划为 NOP
-            nop_nodes.append(node)
 
     print('******************* relevant blocks ************************')
     print('prologue: %#x' % prologue_node.addr)
     print('main_dispatcher: %#x' % main_dispatcher_node.addr)
     relevant_block_addrs = [node.addr for node in relevant_nodes]
     print('relevant_blocks (Total %d):' % len(relevant_block_addrs), [hex(addr) for addr in relevant_block_addrs])
+
+    # 【获取带有完美寄存器上下文的快照】
+    base_state = get_base_state(project, prologue_node.addr, main_dispatcher_node.addr)
+    if base_state is None:
+        print("[-] 错误：无法从 prologue 执行到 main_dispatcher！")
+        sys.exit(-1)
 
     print('******************* symbolic execution *********************')
     relevants = relevant_nodes
@@ -201,7 +214,7 @@ def main():
         hook_addrs = set([])
         for ins in block.capstone.insns:
             if project.arch.name in ARCH_ARM64:
-                # 修复核心 BUG：同时匹配 cset 和 csel ！（你的汇编用的是 CSEL）
+                # OLLVM 双变量平坦化混淆特征
                 if ins.insn.mnemonic.startswith(('cset', 'csel')):
                     if relevant not in patch_instrs:
                         patch_instrs[relevant] = ins
@@ -210,19 +223,18 @@ def main():
                     hook_addrs.add(ins.insn.address)
 
         if has_branches:
-            tmp_addr1 = symbolic_execution(project, relevant_block_addrs, relevant.addr, hook_addrs, claripy.BVV(1, 1), True)
+            tmp_addr1 = symbolic_execution(project, base_state, relevant_block_addrs, relevant.addr, hook_addrs, claripy.BVV(1, 1), True)
             if tmp_addr1 is not None:
                 flow[relevant].append(tmp_addr1)
-            tmp_addr2 = symbolic_execution(project, relevant_block_addrs, relevant.addr, hook_addrs, claripy.BVV(0, 1), True)
+            tmp_addr2 = symbolic_execution(project, base_state, relevant_block_addrs, relevant.addr, hook_addrs, claripy.BVV(0, 1), True)
             if tmp_addr2 is not None:
                 flow[relevant].append(tmp_addr2)
                 
-            # 智能修复：如果 CSEL 是正常的业务逻辑（两个分支流向同一个代码块），则当做无分支块处理
             if len(flow[relevant]) == 2 and flow[relevant][0] == flow[relevant][1]:
                 flow[relevant] = [flow[relevant][0]]
                 del patch_instrs[relevant]
         else:
-            tmp_addr = symbolic_execution(project, relevant_block_addrs, relevant.addr, hook_addrs)
+            tmp_addr = symbolic_execution(project, base_state, relevant_block_addrs, relevant.addr, hook_addrs)
             if tmp_addr is not None:
                 flow[relevant].append(tmp_addr)
 
@@ -235,11 +247,15 @@ def main():
         origin_data = bytearray(origin.read())
         origin_data_len = len(origin_data)
 
-    recovery_file = filename + '_recovered'
+    # 智能修复文件名，这样你 Actions 的 YML 就不需要再去修改后缀了！
+    recovery_file = filename.replace('.so', '_recovered.so')
+    if recovery_file == filename:
+        recovery_file += '_recovered'
     recovery = open(recovery_file, 'wb')
 
-    for nop_node in nop_nodes:
-        fill_nop(origin_data, project.loader.main_object.addr_to_offset(nop_node.addr), nop_node.size, project.arch)
+    # 【安全性修复】：只 NOP 那些被确认为“分发器”的区块，绝不破坏任何被拆分的真实业务块！
+    for dp_node in dispatcher_nodes:
+        fill_nop(origin_data, project.loader.main_object.addr_to_offset(dp_node.addr), dp_node.size, project.arch)
 
     for parent, childs in flow.items():
         if len(childs) == 1:
@@ -275,14 +291,10 @@ def main():
                     patch_value = patch_value[::-1]
                 patch_instruction(origin_data, file_offset, patch_value)
 
-        elif len(childs) == 0:
-            print("[-] Warning: block %#x has 0 valid children, skip patching." % parent.addr)
-
     assert len(origin_data) == origin_data_len, "Error: size of data changed!!!"
     recovery.write(origin_data)
     recovery.close()
     print('Successful! The recovered file: %s' % recovery_file)
-
 
 if __name__ == '__main__':
     main()
