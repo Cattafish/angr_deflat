@@ -34,7 +34,7 @@ class DummyRealloc(angr.SimProcedure):
     def run(self, ptr, size): return 0x60000000
 
 # ========================================================
-# 【关键改进】：获取带有完美寄存器上下文的快照状态
+# 获取带有完美寄存器上下文的快照状态
 # ========================================================
 def get_base_state(project, prologue_addr, main_dispatcher_addr):
     state = project.factory.blank_state(
@@ -55,6 +55,23 @@ def get_base_state(project, prologue_addr, main_dispatcher_addr):
         return sm.found[0]
     return None
 
+# ========================================================
+# 【关键改进】：严格限制分发器块的指令范围
+# ========================================================
+def is_dispatcher_block(project, addr, size):
+    block = project.factory.block(addr, size=size)
+    allowed_mnemonics = {
+        'mov', 'movz', 'movk', 'cmp', 'b', 'nop',
+        'b.eq', 'b.ne', 'b.cs', 'b.hs', 'b.cc', 'b.lo', 
+        'b.mi', 'b.pl', 'b.vs', 'b.vc', 'b.hi', 'b.ls', 
+        'b.ge', 'b.lt', 'b.gt', 'b.le'
+    }
+    for ins in block.capstone.insns:
+        mnem = ins.insn.mnemonic.lower()
+        if mnem not in allowed_mnemonics:
+            return False
+    return True
+
 def symbolic_execution(project, base_state, relevant_block_addrs, start_addr, hook_addrs=None, modify_value=None, inspect=False):
     def retn_procedure(state):
         pass
@@ -63,20 +80,14 @@ def symbolic_execution(project, base_state, relevant_block_addrs, start_addr, ho
         expressions = list(state.scratch.irsb.statements[state.inspect.statement].expressions)
         if len(expressions) != 0 and isinstance(expressions[0], pyvex.expr.ITE):
             state.scratch.temps[expressions[0].cond.tmp] = modify_value
-            # 【修复双状态变量BUG】：绝对不要清除断点！强迫该块里所有的 CSEL 同步走向一致的分支！
-            # state.inspect._breakpoints['statement'] = []
 
     if hook_addrs is not None:
         skip_length = 4 if project.arch.name not in ARCH_X86 else 5
         for hook_addr in hook_addrs:
-            # 挂载空函数来跳过那些耗时的外部或内部 BL 调用
             project.hook(hook_addr, retn_procedure, length=skip_length)
 
-    # 从带有常量的快照状态中启动！
     state = base_state.copy()
     state.regs.pc = start_addr
-    
-    # 强制禁用 UNICORN，否则 statement_inspect 会被引擎直接无视，导致分支强制失败
     state.options.discard(angr.options.UNICORN)
 
     if inspect:
@@ -86,7 +97,7 @@ def symbolic_execution(project, base_state, relevant_block_addrs, start_addr, ho
     sm.step()
     
     step_count = 0
-    max_steps = 200 # 防止被伪分发器带入死循环
+    max_steps = 200
     
     while len(sm.active) > 0:
         for active_state in sm.active:
@@ -99,7 +110,6 @@ def symbolic_execution(project, base_state, relevant_block_addrs, start_addr, ho
         
         step_count += 1
         if step_count > max_steps:
-            print(f"[!] 警告：达到最大步数限制，当前分支进入死胡同。")
             break
 
     return None
@@ -124,10 +134,10 @@ def main():
     project.hook_symbol('memset', DummyMemset())
     project.hook_symbol('free', DummyFree())
     project.hook_symbol('realloc', DummyRealloc())
-    project.hook_symbol('_Znam', DummyMalloc())   # C++ operator new[]
-    project.hook_symbol('_Znwm', DummyMalloc())   # C++ operator new
-    project.hook_symbol('_ZdaPv', DummyFree())    # C++ operator delete[]
-    project.hook_symbol('_ZdlPv', DummyFree())    # C++ operator delete
+    project.hook_symbol('_Znam', DummyMalloc())
+    project.hook_symbol('_Znwm', DummyMalloc())
+    project.hook_symbol('_ZdaPv', DummyFree())
+    project.hook_symbol('_ZdlPv', DummyFree())
     
     cfg = project.analyses.CFGFast(normalize=True, force_complete_scan=False)
     base_addr = project.loader.main_object.mapped_base >> 12 << 12
@@ -152,7 +162,7 @@ def main():
     main_dispatcher_node = list(supergraph.successors(prologue_node))[0]
 
     # ========================================================
-    # 提取完整且纯粹的分发器树 (Dispatcher Tree)
+    # 【安全遍历机制】：仅对完全符合分发特征的节点进行遍历
     # ========================================================
     dispatcher_nodes = set()
     queue = [main_dispatcher_node]
@@ -161,22 +171,13 @@ def main():
         if curr in dispatcher_nodes:
             continue
         
-        is_real_work = False
-        if curr.addr != main_dispatcher_node.addr:
-            block = project.factory.block(curr.addr, size=curr.size)
-            for ins in block.capstone.insns:
-                mnem = ins.insn.mnemonic
-                # 真实代码的强特征：存在调用、访存、修改状态变量、或返回
-                if mnem in ('bl', 'blr', 'ret') or mnem.startswith(('str', 'stp', 'stur', 'csel', 'cset')):
-                    is_real_work = True
-                    break
-
-        if not is_real_work:
+        # 主分发器可能含有局部现场保存指令，特殊放行，其余块必须通过严格的白名单校验
+        if curr.addr == main_dispatcher_node.addr or is_dispatcher_block(project, curr.addr, curr.size):
             dispatcher_nodes.add(curr)
             for succ in supergraph.successors(curr):
                 queue.append(succ)
 
-    # 真实的业务块就是从分发器走出来的那个直接节点
+    # 剔除分发器树，保留所有的业务Handler节点
     relevant_nodes = []
     retn_addrs = [n.addr for n in retn_nodes]
 
@@ -192,7 +193,6 @@ def main():
     relevant_block_addrs = [node.addr for node in relevant_nodes]
     print('relevant_blocks (Total %d):' % len(relevant_block_addrs), [hex(addr) for addr in relevant_block_addrs])
 
-    # 【获取带有完美寄存器上下文的快照】
     base_state = get_base_state(project, prologue_node.addr, main_dispatcher_node.addr)
     if base_state is None:
         print("[-] 错误：无法从 prologue 执行到 main_dispatcher！")
@@ -214,7 +214,6 @@ def main():
         hook_addrs = set([])
         for ins in block.capstone.insns:
             if project.arch.name in ARCH_ARM64:
-                # OLLVM 双变量平坦化混淆特征
                 if ins.insn.mnemonic.startswith(('cset', 'csel')):
                     if relevant not in patch_instrs:
                         patch_instrs[relevant] = ins
@@ -247,13 +246,12 @@ def main():
         origin_data = bytearray(origin.read())
         origin_data_len = len(origin_data)
 
-    # 智能修复文件名，这样你 Actions 的 YML 就不需要再去修改后缀了！
     recovery_file = filename.replace('.so', '_recovered.so')
     if recovery_file == filename:
         recovery_file += '_recovered'
     recovery = open(recovery_file, 'wb')
 
-    # 【安全性修复】：只 NOP 那些被确认为“分发器”的区块，绝不破坏任何被拆分的真实业务块！
+    # 【安全性修复】：只 NOP 经过白名单严格确认的纯粹分发器块，保证 VM 解释器的算术指令完整性
     for dp_node in dispatcher_nodes:
         fill_nop(origin_data, project.loader.main_object.addr_to_offset(dp_node.addr), dp_node.size, project.arch)
 
