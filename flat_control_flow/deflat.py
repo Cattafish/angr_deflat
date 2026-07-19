@@ -262,37 +262,33 @@ def main():
 
     for parent, childs in flow.items():
         if len(childs) == 1:
-            # === 修复 BL/BLR 块被中途截断的致命 Bug ===
-            curr_addr = parent.addr
-            last_instr = None
+            parent_block = project.factory.block(parent.addr, size=parent.size)
+            last_instr = parent_block.capstone.insns[-1]
             
-            # 安全防线：防止异常情况下发生死循环（限制最多向后扫描 30 个基本块）
-            scan_limit = 30  
-            while scan_limit > 0:
-                block = project.factory.block(curr_addr)
-                if len(block.capstone.insns) == 0:
-                    break
+            # === 【终极安全修复】 仅在以 BL/BLR 结尾而被截断的块上触发向后安全追溯 ===
+            if last_instr.mnemonic.lower() in {'bl', 'blr'}:
+                curr_addr = last_instr.address + 4
+                scan_limit = 30  
+                while scan_limit > 0:
+                    block = project.factory.block(curr_addr)
+                    if len(block.capstone.insns) == 0:
+                        break
+                        
+                    last_ins = block.capstone.insns[-1]
+                    mnem = last_ins.mnemonic.lower()
                     
-                last_ins = block.capstone.insns[-1]
-                mnem = last_ins.mnemonic.lower()
-                
-                # 只有遇到真正的跳转指令 B 或 B.cond，才是这个连续业务块真正的出口
-                if mnem == 'b' or mnem.startswith('b.'):
-                    last_instr = last_ins
-                    break
-                
-                # 遇到函数尾部的返回、或跨越函数大小边界，安全截断退出
-                if mnem == 'ret' or curr_addr >= start + target_function.size:
-                    last_instr = last_ins
-                    break
+                    # 只有遇到真正的跳转指令 B 或 B.cond，才是这个连续业务块真正的出口
+                    if mnem == 'b' or mnem.startswith('b.'):
+                        last_instr = last_ins
+                        break
                     
-                curr_addr = last_ins.address + 4
-                scan_limit -= 1
-
-            if last_instr is None:
-                # 降级容错机制：如果由于异常无法顺藤摸瓜，使用原 parent 结尾进行 Patch
-                parent_block = project.factory.block(parent.addr, size=parent.size)
-                last_instr = parent_block.capstone.insns[-1]
+                    # 遇到函数尾部的返回、或跨越函数虚拟地址大小边界，安全截断退出
+                    if mnem == 'ret' or curr_addr >= target_function.addr + target_function.size:
+                        last_instr = last_ins
+                        break
+                        
+                    curr_addr = last_ins.address + 4
+                    scan_limit -= 1
 
             file_offset = project.loader.main_object.addr_to_offset(last_instr.address)
             if project.arch.name in ARCH_ARM64:
