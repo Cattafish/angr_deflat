@@ -56,12 +56,13 @@ def get_base_state(project, prologue_addr, main_dispatcher_addr):
     return None
 
 # ========================================================
-# 【关键改进】：严格限制分发器块的指令范围
+# 【安全遍历机制】：大方放行只读指令，杜绝分发树截断
 # ========================================================
 def is_dispatcher_block(project, addr, size):
     block = project.factory.block(addr, size=size)
     allowed_mnemonics = {
         'mov', 'movz', 'movk', 'cmp', 'b', 'nop',
+        'ldr', 'ldur', 'ldp', 'ldpsw',  # 放行只读内存/栈指令，防止分发器在恢复现场时被卡住
         'b.eq', 'b.ne', 'b.cs', 'b.hs', 'b.cc', 'b.lo', 
         'b.mi', 'b.pl', 'b.vs', 'b.vc', 'b.hi', 'b.ls', 
         'b.ge', 'b.lt', 'b.gt', 'b.le'
