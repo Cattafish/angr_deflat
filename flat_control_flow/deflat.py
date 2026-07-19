@@ -56,21 +56,24 @@ def get_base_state(project, prologue_addr, main_dispatcher_addr):
     return None
 
 # ========================================================
-# 【自适应边界】：移除 size 约束，利用 angr 自动截断，放行只读指令
+# 【黑名单判定法】：排除所有写内存、调用、条件选择指令，100% 降伏分发器
 # ========================================================
 def is_dispatcher_block(project, addr):
-    # 允许 angr 引擎自动识别基本块边界，完美规避末尾对齐填充字节的干扰
-    block = project.factory.block(addr) 
-    allowed_mnemonics = {
-        'mov', 'movz', 'movk', 'cmp', 'b', 'nop',
-        'ldr', 'ldur', 'ldp', 'ldpsw',
-        'b.eq', 'b.ne', 'b.cs', 'b.hs', 'b.cc', 'b.lo', 
-        'b.mi', 'b.pl', 'b.vs', 'b.vc', 'b.hi', 'b.ls', 
-        'b.ge', 'b.lt', 'b.gt', 'b.le'
+    # 让 angr 自动截断基本块，避免末尾垃圾字节的干扰
+    block = project.factory.block(addr)
+    
+    # 任何含有以下指令特征的，绝对是真实业务块或现场恢复块，严禁归入分发器！
+    prohibited = {
+        'bl', 'blr', 'ret', 'svc',
+        'str', 'stp', 'stur', 'strb', 'strh', 'sturb', 'sturh',
+        'csel', 'cset', 'csinc', 'csinv', 'csneg',
+        'fadd', 'fsub', 'fmul', 'fdiv', 'tbl', 'tbx'
     }
+    
     for ins in block.capstone.insns:
         mnem = ins.insn.mnemonic.lower()
-        if mnem not in allowed_mnemonics:
+        # 精准匹配或前缀匹配（例如 strb 匹配 str，stur 匹配 stur）
+        if mnem in prohibited or any(mnem.startswith(p) for p in prohibited):
             return False
     return True
 
