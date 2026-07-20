@@ -262,33 +262,37 @@ def main():
 
     for parent, childs in flow.items():
         if len(childs) == 1:
-            parent_block = project.factory.block(parent.addr, size=parent.size)
-            last_instr = parent_block.capstone.insns[-1]
-            
             # === 【终极安全修复】 仅在以 BL/BLR 结尾而被截断的块上触发向后安全追溯 ===
-            if last_instr.mnemonic.lower() in {'bl', 'blr'}:
-                curr_addr = last_instr.address + 4
-                scan_limit = 30  
-                while scan_limit > 0:
-                    block = project.factory.block(curr_addr)
-                    if len(block.capstone.insns) == 0:
-                        break
-                        
-                    last_ins = block.capstone.insns[-1]
-                    mnem = last_ins.mnemonic.lower()
+            curr_addr = parent.addr
+            last_instr = None
+            
+            # 安全防线：防止异常情况下发生死循环（限制最多向后扫描 30 个基本块）
+            scan_limit = 30  
+            while scan_limit > 0:
+                block = project.factory.block(curr_addr)
+                if len(block.capstone.insns) == 0:
+                    break
                     
-                    # 只有遇到真正的跳转指令 B 或 B.cond，才是这个连续业务块真正的出口
-                    if mnem == 'b' or mnem.startswith('b.'):
-                        last_instr = last_ins
-                        break
+                last_ins = block.capstone.insns[-1]
+                mnem = last_ins.mnemonic.lower()
+                
+                # 只有遇到真正的跳转指令 B 或 B.cond，才是这个连续业务块真正的出口
+                if mnem == 'b' or mnem.startswith('b.'):
+                    last_instr = last_ins
+                    break
+                
+                # 遇到函数尾部的返回、或跨越函数虚拟地址大小边界，安全截断退出
+                if mnem == 'ret' or curr_addr >= target_function.addr + target_function.size:
+                    last_instr = last_ins
+                    break
                     
-                    # 遇到函数尾部的返回、或跨越函数虚拟地址大小边界，安全截断退出
-                    if mnem == 'ret' or curr_addr >= target_function.addr + target_function.size:
-                        last_instr = last_ins
-                        break
-                        
-                    curr_addr = last_ins.address + 4
-                    scan_limit -= 1
+                curr_addr = last_ins.address + 4
+                scan_limit -= 1
+
+            if last_instr is None:
+                # 降级容错机制：如果由于异常无法顺藤摸瓜，使用原 parent 结尾进行 Patch
+                parent_block = project.factory.block(parent.addr, size=parent.size)
+                last_instr = parent_block.capstone.insns[-1]
 
             file_offset = project.loader.main_object.addr_to_offset(last_instr.address)
             if project.arch.name in ARCH_ARM64:
@@ -309,13 +313,18 @@ def main():
             
             if project.arch.name in ARCH_ARM64:
                 bx_cond = instr.op_str.split(',')[-1].strip()
-                patch_value = ins_b_jmp_hex_arm64(instr.address, childs[0], bx_cond)
+                # ========================================================
+                # 【终极分支对调修复】：
+                # 纠正 ARM64 架构下 PyVEX ITE 条件不满足（Condition Not Met）导致的真假分支颠倒问题 [1]！
+                # 将 childs[1] 判定为真分支（跳向 B.cond），childs[0] 判定为假分支（顺序 B 执行） [1]。
+                # ========================================================
+                patch_value = ins_b_jmp_hex_arm64(instr.address, childs[1], bx_cond)
                 if project.arch.memory_endness == 'Iend_BE':
                     patch_value = patch_value[::-1]
                 patch_instruction(origin_data, file_offset, patch_value)
 
                 file_offset += 4
-                patch_value = ins_b_jmp_hex_arm64(instr.address+4, childs[1], 'b')
+                patch_value = ins_b_jmp_hex_arm64(instr.address+4, childs[0], 'b')
                 if project.arch.memory_endness == 'Iend_BE':
                     patch_value = patch_value[::-1]
                 patch_instruction(origin_data, file_offset, patch_value)
