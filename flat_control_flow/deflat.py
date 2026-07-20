@@ -236,8 +236,13 @@ def main():
         recovery_file += '_recovered'
     recovery = open(recovery_file, 'wb')
 
-    for dp_node in dispatcher_nodes:
-        fill_nop(origin_data, project.loader.main_object.addr_to_offset(dp_node.addr), dp_node.size, project.arch)
+    # ========================================================
+    # 【无损恢复安全改动】：
+    # 绝对不要 NOP 任何分发器（注释掉原先的 dp_node 覆写循环）！
+    # 依靠物理跳转直接 Bypass 分发器，保证所有潜在承上启下的块毫发无损！
+    # ========================================================
+    # for dp_node in dispatcher_nodes:
+    #     fill_nop(origin_data, project.loader.main_object.addr_to_offset(dp_node.addr), dp_node.size, project.arch)
 
     for parent, childs in flow.items():
         if len(childs) == 1:
@@ -287,7 +292,6 @@ def main():
             
             if project.arch.name in ARCH_ARM64:
                 bx_cond = instr.op_str.split(',')[-1].strip()
-                # === 恢复原始正确的分支条件对应关系 ===
                 patch_value = ins_b_jmp_hex_arm64(instr.address, childs[0], bx_cond)
                 if project.arch.memory_endness == 'Iend_BE':
                     patch_value = patch_value[::-1]
