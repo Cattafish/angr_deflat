@@ -15,9 +15,6 @@ from util import *
 import logging
 logging.getLogger('angr.state_plugins.symbolic_memory').setLevel(logging.ERROR)
 
-# ========================================================
-# 拦截 C/C++ 内存分配，避免 DSE 陷入深渊
-# ========================================================
 class DummyMemcpy(angr.SimProcedure):
     def run(self, dst, src, size): return dst
 
@@ -33,9 +30,6 @@ class DummyFree(angr.SimProcedure):
 class DummyRealloc(angr.SimProcedure):
     def run(self, ptr, size): return 0x60000000
 
-# ========================================================
-# 获取带有完美寄存器上下文的快照状态
-# ========================================================
 def get_base_state(project, prologue_addr, main_dispatcher_addr):
     state = project.factory.blank_state(
         addr=prologue_addr,
@@ -55,24 +49,16 @@ def get_base_state(project, prologue_addr, main_dispatcher_addr):
         return sm.found[0]
     return None
 
-# ========================================================
-# 【黑名单判定法】：排除所有写内存、调用、条件选择指令，100% 降伏分发器
-# ========================================================
 def is_dispatcher_block(project, addr):
-    # 让 angr 自动截断基本块，避免末尾垃圾字节的干扰
     block = project.factory.block(addr)
-    
-    # 任何含有以下指令特征的，绝对是真实业务块或现场恢复块，严禁归入分发器！
     prohibited = {
         'bl', 'blr', 'ret', 'svc',
         'str', 'stp', 'stur', 'strb', 'strh', 'sturb', 'sturh',
         'csel', 'cset', 'csinc', 'csinv', 'csneg',
         'fadd', 'fsub', 'fmul', 'fdiv', 'tbl', 'tbx'
     }
-    
     for ins in block.capstone.insns:
         mnem = ins.insn.mnemonic.lower()
-        # 精准匹配或前缀匹配（例如 strb 匹配 str，stur 匹配 stur）
         if mnem in prohibited or any(mnem.startswith(p) for p in prohibited):
             return False
     return True
@@ -166,23 +152,17 @@ def main():
 
     main_dispatcher_node = list(supergraph.successors(prologue_node))[0]
 
-    # ========================================================
-    # 【安全遍历机制】：仅对完全符合分发特征的节点进行遍历
-    # ========================================================
     dispatcher_nodes = set()
     queue = [main_dispatcher_node]
     while queue:
         curr = queue.pop(0)
         if curr in dispatcher_nodes:
             continue
-        
-        # 主分发器可能含有局部现场保存指令，特殊放行，其余块必须通过严格的白名单校验
         if curr.addr == main_dispatcher_node.addr or is_dispatcher_block(project, curr.addr):
             dispatcher_nodes.add(curr)
             for succ in supergraph.successors(curr):
                 queue.append(succ)
 
-    # 剔除分发器树，保留所有的业务Handler节点
     relevant_nodes = []
     retn_addrs = [n.addr for n in retn_nodes]
 
@@ -256,17 +236,14 @@ def main():
         recovery_file += '_recovered'
     recovery = open(recovery_file, 'wb')
 
-    # 【安全性修复】：只 NOP 经过白名单严格确认的纯粹分发器块，保证 VM 解释器的算术指令完整性
     for dp_node in dispatcher_nodes:
         fill_nop(origin_data, project.loader.main_object.addr_to_offset(dp_node.addr), dp_node.size, project.arch)
 
     for parent, childs in flow.items():
         if len(childs) == 1:
-            # === 【终极安全修复】 仅在以 BL/BLR 结尾而被截断的块上触发向后安全追溯 ===
             curr_addr = parent.addr
             last_instr = None
             
-            # 安全防线：防止异常情况下发生死循环（限制最多向后扫描 30 个基本块）
             scan_limit = 30  
             while scan_limit > 0:
                 block = project.factory.block(curr_addr)
@@ -276,12 +253,10 @@ def main():
                 last_ins = block.capstone.insns[-1]
                 mnem = last_ins.mnemonic.lower()
                 
-                # 只有遇到真正的跳转指令 B 或 B.cond，才是这个连续业务块真正的出口
                 if mnem == 'b' or mnem.startswith('b.'):
                     last_instr = last_ins
                     break
                 
-                # 遇到函数尾部的返回、或跨越函数虚拟地址大小边界，安全截断退出
                 if mnem == 'ret' or curr_addr >= target_function.addr + target_function.size:
                     last_instr = last_ins
                     break
@@ -290,7 +265,6 @@ def main():
                 scan_limit -= 1
 
             if last_instr is None:
-                # 降级容错机制：如果由于异常无法顺藤摸瓜，使用原 parent 结尾进行 Patch
                 parent_block = project.factory.block(parent.addr, size=parent.size)
                 last_instr = parent_block.capstone.insns[-1]
 
@@ -313,18 +287,14 @@ def main():
             
             if project.arch.name in ARCH_ARM64:
                 bx_cond = instr.op_str.split(',')[-1].strip()
-                # ========================================================
-                # 【终极分支对调修复】：
-                # 纠正 ARM64 架构下 PyVEX ITE 条件不满足（Condition Not Met）导致的真假分支颠倒问题 [1]！
-                # 将 childs[1] 判定为真分支（跳向 B.cond），childs[0] 判定为假分支（顺序 B 执行） [1]。
-                # ========================================================
-                patch_value = ins_b_jmp_hex_arm64(instr.address, childs[1], bx_cond)
+                # === 恢复原始正确的分支条件对应关系 ===
+                patch_value = ins_b_jmp_hex_arm64(instr.address, childs[0], bx_cond)
                 if project.arch.memory_endness == 'Iend_BE':
                     patch_value = patch_value[::-1]
                 patch_instruction(origin_data, file_offset, patch_value)
 
                 file_offset += 4
-                patch_value = ins_b_jmp_hex_arm64(instr.address+4, childs[0], 'b')
+                patch_value = ins_b_jmp_hex_arm64(instr.address+4, childs[1], 'b')
                 if project.arch.memory_endness == 'Iend_BE':
                     patch_value = patch_value[::-1]
                 patch_instruction(origin_data, file_offset, patch_value)
