@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 
 import sys
-sys.path.append("..")
-
 import argparse
 import angr
 import pyvex
@@ -81,7 +79,7 @@ def symbolic_execution(project, base_state, relevant_block_addrs, start_addr, ho
     state.regs.pc = start_addr
     state.options.discard(angr.options.UNICORN)
 
-    if inspect:
+    if inspect and modify_value is not None:
         state.inspect.b('statement', when=angr.state_plugins.inspect.BP_BEFORE, action=statement_inspect)
     
     sm = project.factory.simulation_manager(state)
@@ -196,17 +194,25 @@ def main():
         print('-------------------dse %#x---------------------' % relevant.addr)
         block = project.factory.block(relevant.addr, size=relevant.size)
         has_branches = False
+        is_bcf = False   # BCF 块标志位
         hook_addrs = set([])
+        
         for ins in block.capstone.insns:
+            mnem = ins.insn.mnemonic.lower()
+            # BCF 不透明谓词会强制加载全局变量，特征是存在 ADRP
+            if mnem == 'adrp':
+                is_bcf = True
+                
             if project.arch.name in ARCH_ARM64:
-                if ins.insn.mnemonic.startswith(('cset', 'csel')):
+                if mnem.startswith(('cset', 'csel')):
                     if relevant not in patch_instrs:
                         patch_instrs[relevant] = ins
                         has_branches = True
-                elif ins.insn.mnemonic in {'bl', 'blr'}:
+                elif mnem in {'bl', 'blr'}:
                     hook_addrs.add(ins.insn.address)
 
-        if has_branches:
+        # 核心改动：如果是真的分支判断，暴力干涉探索两条路；如果是 BCF 死分支，禁止干涉！
+        if has_branches and not is_bcf:
             tmp_addr1 = symbolic_execution(project, base_state, relevant_block_addrs, relevant.addr, hook_addrs, claripy.BVV(1, 1), True)
             if tmp_addr1 is not None:
                 flow[relevant].append(tmp_addr1)
@@ -218,7 +224,8 @@ def main():
                 flow[relevant] = [flow[relevant][0]]
                 del patch_instrs[relevant]
         else:
-            tmp_addr = symbolic_execution(project, base_state, relevant_block_addrs, relevant.addr, hook_addrs)
+            # 走到这里的，要么是单分支流，要么是被 Angr 的 Z3 求解器降维打击的 BCF 虚假控制流
+            tmp_addr = symbolic_execution(project, base_state, relevant_block_addrs, relevant.addr, hook_addrs, modify_value=None, inspect=False)
             if tmp_addr is not None:
                 flow[relevant].append(tmp_addr)
 
@@ -236,18 +243,13 @@ def main():
         recovery_file += '_recovered'
     recovery = open(recovery_file, 'wb')
 
-    # 【新增】：建立蹦床内存池 (Trampoline Pool)
-    # 因为我们在完全解平坦化后，所有的分发器块都会变成 100% 无法触达的死代码。
-    # 我们利用这些废弃的内存区存储 8 字节（B.cond + B）的双分支跳转逻辑。
     trampoline_pool = []
     for dp_node in dispatcher_nodes:
-        # 按 8 字节一块切分供后续分配
-        for offset in range(0, dp_node.size - 8, 8):
+        # 修改切片策略，保障连 8 字节的小 dispatcher 节点也能安全提供蹦床
+        for offset in range(0, dp_node.size - 7, 8):
             trampoline_pool.append(dp_node.addr + offset)
 
     for parent, childs in flow.items():
-        
-        # 共同步骤：寻找该基本块（Parent）物理意义上的结尾跳转指令（B 或 RET）
         curr_addr = parent.addr
         last_instr = None
         scan_limit = 40  
@@ -295,17 +297,13 @@ def main():
                 print("[-] 严重错误：分发器蹦床池空间耗尽！")
                 sys.exit(-1)
 
-            # 分配一块死区蹦床
             tramp_addr = trampoline_pool.pop(0)
 
-            # 1. 修改原基本块末尾的 B 语句，让它无条件跳转到蹦床区 (替代了暴力的 fill_nop，保护业务代码)
             patch_value_main = ins_b_jmp_hex_arm64(last_instr.address, tramp_addr, 'b')
             if project.arch.memory_endness == 'Iend_BE':
                 patch_value_main = patch_value_main[::-1]
             patch_instruction(origin_data, file_offset, patch_value_main)
             
-            # 2. 在蹦床区写入 B.cond 和 B 
-            # (保留你之前发现的 child[0]/child[1] 对调映射来抵消 PyVEX 反转)
             tramp_offset = project.loader.main_object.addr_to_offset(tramp_addr)
             patch_value_1 = ins_b_jmp_hex_arm64(tramp_addr, childs[0], bx_cond)
             patch_value_2 = ins_b_jmp_hex_arm64(tramp_addr+4, childs[1], 'b')
