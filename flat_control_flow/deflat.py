@@ -236,44 +236,47 @@ def main():
         recovery_file += '_recovered'
     recovery = open(recovery_file, 'wb')
 
-    # ========================================================
-    # 【无损恢复安全改动】：
-    # 绝对不要 NOP 任何分发器（注释掉原先的 dp_node 覆写循环）！
-    # 依靠物理跳转直接 Bypass 分发器，保证所有潜在承上启下的块毫发无损！
-    # ========================================================
-    # for dp_node in dispatcher_nodes:
-    #     fill_nop(origin_data, project.loader.main_object.addr_to_offset(dp_node.addr), dp_node.size, project.arch)
+    # 【新增】：建立蹦床内存池 (Trampoline Pool)
+    # 因为我们在完全解平坦化后，所有的分发器块都会变成 100% 无法触达的死代码。
+    # 我们利用这些废弃的内存区存储 8 字节（B.cond + B）的双分支跳转逻辑。
+    trampoline_pool = []
+    for dp_node in dispatcher_nodes:
+        # 按 8 字节一块切分供后续分配
+        for offset in range(0, dp_node.size - 8, 8):
+            trampoline_pool.append(dp_node.addr + offset)
 
     for parent, childs in flow.items():
-        if len(childs) == 1:
-            curr_addr = parent.addr
-            last_instr = None
+        
+        # 共同步骤：寻找该基本块（Parent）物理意义上的结尾跳转指令（B 或 RET）
+        curr_addr = parent.addr
+        last_instr = None
+        scan_limit = 40  
+        while scan_limit > 0:
+            block = project.factory.block(curr_addr)
+            if len(block.capstone.insns) == 0:
+                break
+                
+            last_ins = block.capstone.insns[-1]
+            mnem = last_ins.mnemonic.lower()
             
-            scan_limit = 30  
-            while scan_limit > 0:
-                block = project.factory.block(curr_addr)
-                if len(block.capstone.insns) == 0:
-                    break
-                    
-                last_ins = block.capstone.insns[-1]
-                mnem = last_ins.mnemonic.lower()
+            if mnem == 'b' or mnem.startswith('b.'):
+                last_instr = last_ins
+                break
+            
+            if mnem == 'ret' or curr_addr >= target_function.addr + target_function.size:
+                last_instr = last_ins
+                break
                 
-                if mnem == 'b' or mnem.startswith('b.'):
-                    last_instr = last_ins
-                    break
-                
-                if mnem == 'ret' or curr_addr >= target_function.addr + target_function.size:
-                    last_instr = last_ins
-                    break
-                    
-                curr_addr = last_ins.address + 4
-                scan_limit -= 1
+            curr_addr = last_ins.address + 4
+            scan_limit -= 1
 
-            if last_instr is None:
-                parent_block = project.factory.block(parent.addr, size=parent.size)
-                last_instr = parent_block.capstone.insns[-1]
+        if last_instr is None:
+            parent_block = project.factory.block(parent.addr, size=parent.size)
+            last_instr = parent_block.capstone.insns[-1]
 
-            file_offset = project.loader.main_object.addr_to_offset(last_instr.address)
+        file_offset = project.loader.main_object.addr_to_offset(last_instr.address)
+
+        if len(childs) == 1:
             if project.arch.name in ARCH_ARM64:
                 if parent.addr in [start, base_addr + start]:
                     file_offset += 4
@@ -286,22 +289,33 @@ def main():
             
         elif len(childs) == 2:
             instr = patch_instrs[parent]
-            file_offset = project.loader.main_object.addr_to_offset(instr.address)
-            block_end_offset = project.loader.main_object.addr_to_offset(parent.addr + parent.size)
-            fill_nop(origin_data, file_offset, block_end_offset - file_offset, project.arch)
+            bx_cond = instr.op_str.split(',')[-1].strip()
             
-            if project.arch.name in ARCH_ARM64:
-                bx_cond = instr.op_str.split(',')[-1].strip()
-                patch_value = ins_b_jmp_hex_arm64(instr.address, childs[0], bx_cond)
-                if project.arch.memory_endness == 'Iend_BE':
-                    patch_value = patch_value[::-1]
-                patch_instruction(origin_data, file_offset, patch_value)
+            if len(trampoline_pool) == 0:
+                print("[-] 严重错误：分发器蹦床池空间耗尽！")
+                sys.exit(-1)
 
-                file_offset += 4
-                patch_value = ins_b_jmp_hex_arm64(instr.address+4, childs[1], 'b')
-                if project.arch.memory_endness == 'Iend_BE':
-                    patch_value = patch_value[::-1]
-                patch_instruction(origin_data, file_offset, patch_value)
+            # 分配一块死区蹦床
+            tramp_addr = trampoline_pool.pop(0)
+
+            # 1. 修改原基本块末尾的 B 语句，让它无条件跳转到蹦床区 (替代了暴力的 fill_nop，保护业务代码)
+            patch_value_main = ins_b_jmp_hex_arm64(last_instr.address, tramp_addr, 'b')
+            if project.arch.memory_endness == 'Iend_BE':
+                patch_value_main = patch_value_main[::-1]
+            patch_instruction(origin_data, file_offset, patch_value_main)
+            
+            # 2. 在蹦床区写入 B.cond 和 B 
+            # (保留你之前发现的 child[0]/child[1] 对调映射来抵消 PyVEX 反转)
+            tramp_offset = project.loader.main_object.addr_to_offset(tramp_addr)
+            patch_value_1 = ins_b_jmp_hex_arm64(tramp_addr, childs[0], bx_cond)
+            patch_value_2 = ins_b_jmp_hex_arm64(tramp_addr+4, childs[1], 'b')
+            
+            if project.arch.memory_endness == 'Iend_BE':
+                patch_value_1 = patch_value_1[::-1]
+                patch_value_2 = patch_value_2[::-1]
+
+            patch_instruction(origin_data, tramp_offset, patch_value_1)
+            patch_instruction(origin_data, tramp_offset+4, patch_value_2)
 
     assert len(origin_data) == origin_data_len, "Error: size of data changed!!!"
     recovery.write(origin_data)
