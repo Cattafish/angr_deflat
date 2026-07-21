@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 
+import os
 import sys
+
+# 动态解析并添加路径，彻底解决无论在何处启动脚本都找不到 am_graph 或 util 的问题
+script_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(script_dir)
+sys.path.append(script_dir)
+sys.path.append(parent_dir)
+
 import argparse
 import angr
 import pyvex
@@ -211,7 +219,7 @@ def main():
                 elif mnem in {'bl', 'blr'}:
                     hook_addrs.add(ins.insn.address)
 
-        # 核心改动：如果是真的分支判断，暴力干涉探索两条路；如果是 BCF 死分支，禁止干涉！
+        # 如果是真实分支且非 BCF，强制探索两条路；如果是 BCF 相关的条件状态，不进行人工干预，由 Angr 的 Z3 自行计算
         if has_branches and not is_bcf:
             tmp_addr1 = symbolic_execution(project, base_state, relevant_block_addrs, relevant.addr, hook_addrs, claripy.BVV(1, 1), True)
             if tmp_addr1 is not None:
@@ -224,7 +232,6 @@ def main():
                 flow[relevant] = [flow[relevant][0]]
                 del patch_instrs[relevant]
         else:
-            # 走到这里的，要么是单分支流，要么是被 Angr 的 Z3 求解器降维打击的 BCF 虚假控制流
             tmp_addr = symbolic_execution(project, base_state, relevant_block_addrs, relevant.addr, hook_addrs, modify_value=None, inspect=False)
             if tmp_addr is not None:
                 flow[relevant].append(tmp_addr)
@@ -245,7 +252,7 @@ def main():
 
     trampoline_pool = []
     for dp_node in dispatcher_nodes:
-        # 修改切片策略，保障连 8 字节的小 dispatcher 节点也能安全提供蹦床
+        # 兼容处理 8 字节以及以上的 dispatcher 块
         for offset in range(0, dp_node.size - 7, 8):
             trampoline_pool.append(dp_node.addr + offset)
 
